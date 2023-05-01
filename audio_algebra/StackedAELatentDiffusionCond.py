@@ -67,89 +67,112 @@ def alpha_sigma_to_t(alpha, sigma):
 
 
 # %% ../StackedAELatentDiffusionCond.ipynb 7
-@torch.no_grad()
-def sample(model, x, steps, eta, step_list=None, **extra_args):
-    """Draws samples from a model given starting noise."""
-    print("sample: x .shape, dtype device =",x.shape, x.dtype, x.device)
-    ts = x.new_ones([x.shape[0]])
-    if step_list is None:        # Create the noise schedule
-        t = torch.linspace(1, 0, steps + 1)[:-1].to(x.dtype).to(x.device)
-    else:                        # Noise schedule already created & passed in 
-        t = step_list
-    #print("sample: t = ",t)
-        
-    alphas, sigmas = get_alphas_sigmas(t)
-    steps = len(t)  # just in case len(step_list) didn't match up with steps
-
-    # The sampling loop
-    for i in trange(steps):
-
-        # Get the model output (v, the predicted velocity)
-        #with torch.cuda.amp.autocast():
-        v = model(x, ts * t[i], **extra_args).to(x.dtype)
-
-        # Predict the noise and the denoised image
-        pred = x * alphas[i] - v * sigmas[i]
-        eps = x * sigmas[i] + v * alphas[i]
-
-        # If we are not on the last timestep, compute the noisy image for the
-        # next timestep.
-        if i < steps - 1:
-            # If eta > 0, adjust the scaling factor for the predicted noise
-            # downward according to the amount of additional noise to add
-            ddim_sigma = eta * (sigmas[i + 1]**2 / sigmas[i]**2).sqrt() * \
-                (1 - alphas[i]**2 / alphas[i + 1]**2).sqrt()
-            adjusted_sigma = (sigmas[i + 1]**2 - ddim_sigma**2).sqrt()
-
-            # Recombine the predicted noise and predicted denoised image in the
-            # correct proportions for the next step
-            x = pred * alphas[i + 1] + eps * adjusted_sigma
-
-            # Add the correct amount of fresh noise
-            if eta:
-                x += torch.randn_like(x) * ddim_sigma
-
-    # If we are on the last timestep, output the denoised image
-    #print("sample: pred.shape =",pred.shape)
-    return pred
 
 
+# Sampler, utils and model wrapper stolen from: https://github.com/crowsonkb/k-diffusion/ :)
+def append_dims(x, target_dims):
+    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
+    dims_to_append = target_dims - x.ndim
+    if dims_to_append < 0:
+        raise ValueError(f'input has {x.ndim} dims but target_dims is {target_dims}, which is less')
+    return x[(...,) + (None,) * dims_to_append]
 
+class VDenoiser(nn.Module):
+    """A v-diffusion-pytorch model wrapper for k-diffusion."""
 
+    def __init__(self, inner_model):
+        super().__init__()
+        self.inner_model = inner_model
+        self.sigma_data = 1.
+
+    def get_scalings(self, sigma):
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = -sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2) ** 0.5
+        c_in = 1 / (sigma ** 2 + self.sigma_data ** 2) ** 0.5
+        return c_skip, c_out, c_in
+
+    def sigma_to_t(self, sigma):
+        return sigma.atan() / math.pi * 2
+
+    def t_to_sigma(self, t):
+        return (t * math.pi / 2).tan()
+
+    def loss(self, input, noise, sigma, **kwargs):
+        c_skip, c_out, c_in = [append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+        noised_input = input + noise * append_dims(sigma, input.ndim)
+        model_output = self.inner_model(noised_input * c_in, self.sigma_to_t(sigma), **kwargs)
+        target = (input - c_skip * noised_input) / c_out
+        return (model_output - target).pow(2).flatten(1).mean(1)
+
+    def forward(self, input, sigma, **kwargs):
+        c_skip, c_out, c_in = [append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
+        return self.inner_model(input * c_in, self.sigma_to_t(sigma), **kwargs) * c_out + input * c_skip    
+
+def get_sigmas_polyexponential(n, sigma_min, sigma_max, rho=1., device='cpu'):
+    """Constructs an polynomial in log sigma noise schedule."""
+    ramp = torch.linspace(1, 0, n, device=device) ** rho
+    sigmas = torch.exp(ramp * (math.log(sigma_max) - math.log(sigma_min)) + math.log(sigma_min))
+    return torch.cat([sigmas, sigmas.new_zeros([1])])
 
 @torch.no_grad()
-def resample(model_fn, 
-             audio_latents,  # note this is not real audio but rather latents of init audio
-             steps=100, 
-             eta=0, 
-             sampler_type="v-ddim", 
-             noise_level=1.0, 
-             device='cuda',
-             debug=True,
-             batch_size=1,
-             effective_length=2048, # TODO: make more flexible later hard-coded now for 22s runs. 
-             **extra_args):
-    """from Dance_Diffusion.ipynb: Noise the input"""
-    if debug: print(f"resample: audio_latents.shape = {audio_latents.shape}, steps = {steps}, eta = {eta}, noise_level = {noise_level}")
-    while len(audio_latents.shape) < 3: 
-        audio_latents = audio_latents.unsqueeze(0)  # add a batch dim and/or channel dim if needed
-    if debug: print(f"resample: audio_latents.shape dtype device = {audio_latents.shape} {audio_latents.dtype} {audio_latents.device}")
+def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=None):
+    """DPM-Solver++(2M)."""
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+    sigma_fn = lambda t: t.neg().exp()
+    t_fn = lambda sigma: sigma.log().neg()
+    old_denoised = None
 
-    batch_size=1
+    for i in trange(len(sigmas) - 1, disable=disable):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
+        t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        h = t_next - t
+        if old_denoised is None or sigmas[i + 1] == 0:
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+        else:
+            h_last = t - t_fn(sigmas[i - 1])
+            r = h_last / h
+            denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+        old_denoised = denoised
+    return x
+
+def sample(
+    model,
+    x:torch.Tensor,
+    steps:int,
+    sigma_min:float,
+    sigma_max:float,
+    step_list=None,
+    device='cuda',
+    debug:bool=False,
+    **extra_args
+):
+    step_list = get_sigmas_polyexponential(steps, sigma_min, sigma_max, 1.0, device) if step_list is None else step_list
+    return sample_dpmpp_2m(VDenoiser(model), x, step_list, **extra_args)
     
-    if sampler_type.startswith("v-"):
-        t = torch.linspace(0, 1, steps + 1, device=device, dtype=audio_latents.dtype)
-        step_list = t  # get_spliced_ddpm_cosine_schedule(t) #  get_crash_schedule(t)
-        step_list = step_list[step_list < noise_level]
-        alpha, sigma = get_alphas_sigmas(step_list[-1])
-        noised = torch.randn(audio_latents.shape, device=device, dtype=audio_latents.dtype)
-
-        noised = audio_latents.to(device) * alpha + noised * sigma
-        noise = noised
-        return sample(model_fn, noise, steps, eta, step_list=step_list.flip(0)[:-1], **extra_args)
-    else:
-        raise ValueError(f"Sorry, sampler {sampler_type} not implemented yet") 
-        return None
+def resample(
+    model, 
+    audio_latents:torch.Tensor,  # note this is not real audio but rather latents of init audio
+    steps:int,
+    sigma_min:float,
+    sigma_max:float, 
+    noise_level:float=1.0, 
+    step_list=None,
+    device='cuda',
+    debug:bool=False,
+    **extra_args
+):
+    sigma_max = sigma_max * noise_level
+    step_list = get_sigmas_polyexponential(steps, sigma_min, sigma_max, 1.0, device) if step_list is None else step_list
+    
+    noise = torch.randn(audio_latents.shape, device=device, dtype=audio_latents.dtype)
+    noised = audio_latents + (noise * step_list[0])
+    
+    return sample_dpmpp_2m(VDenoiser(model), noised, step_list, **extra_args)
+    
   
 
 # %% ../StackedAELatentDiffusionCond.ipynb 8
@@ -206,11 +229,16 @@ class LatentAudioDiffusionAutoencoder(pl.LightningModule):
         return second_stage_latents
 
     def decode(self, latents, steps=100, device="cuda", init_audio=None, init_strength=0.4, debug=True):
-        first_stage_latent_noise = torch.randn([latents.shape[0], self.latent_dim, latents.shape[2]*self.latent_downsampling_ratio]).to(latents.dtype).to(device)
-        if init_audio is None: 
-            first_stage_sampled = sample(self.diffusion, first_stage_latent_noise, steps, 0, cond=latents)
+        
+        sigma_min_decoder = 0.1153
+        sigma_max_decoder = 50 # have fun w this, usually 50 is enough to make noise_level = 1 sound identical to the noise itself
+        
+        if init_audio is None:
+            first_stage_latent_noise = sigma_max_decoder * torch.randn([latents.shape[0], self.latent_dim, latents.shape[2]*self.latent_downsampling_ratio]).to(latents.dtype).to(device)
+            first_stage_sampled = sample(self.diffusion, first_stage_latent_noise, steps, sigma_min_decoder, sigma_max_decoder, None, device, debug, cond=latents)
         else:
-            first_stage_sampled = resample(self.diffusion, init_audio, steps, 0, cond=latents, noise_level=(1.0-init_strength))
+            first_stage_sampled = resample(self.diffusion, init_audio, steps, sigma_min_decoder, sigma_max_decoder, (1.0-init_strength), None, device, debug, cond=latents)
+        
         first_stage_sampled = first_stage_sampled.clamp(-1, 1)
         if debug: print("LatentAudioDiffusionAutoencoder: calling self.autoencoder.decode")
         decoded = self.autoencoder.decode(first_stage_sampled)
